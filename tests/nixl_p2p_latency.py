@@ -93,9 +93,8 @@ def make_tensor(num_bytes, dtype, device, fill_value, row_bytes):
     return tensor, num_elements, padded_elements * element_size
 
 
-def get_xfer_descs(agent, tensor):
-    rows = [tensor[i, :] for i in range(tensor.shape[0])]
-    return agent.get_xfer_descs(rows)
+def get_tensor_rows(tensor):
+    return [tensor[i, :] for i in range(tensor.shape[0])]
 
 
 def wait_until(predicate, description, timeout_seconds):
@@ -162,8 +161,6 @@ def target(args, dtype):
     config = nixl_agent_config(True, True, args.port)
     agent = nixl_agent("target", config)
 
-    wait_for_metadata(agent, "initiator", args.timeout)
-
     for num_bytes in args.sizes:
         tensor, _, actual_bytes = make_tensor(
             num_bytes, dtype, f"cuda:{args.src_device}", 1, args.row_bytes
@@ -175,9 +172,12 @@ def target(args, dtype):
             raise RuntimeError("target memory registration failed")
 
         try:
-            target_descs = get_xfer_descs(agent, tensor)
+            target_rows = get_tensor_rows(tensor)
+            target_descs = agent.get_xfer_descs(target_rows)
             if not target_descs:
                 raise RuntimeError("target transfer descriptor creation failed")
+
+            wait_for_metadata(agent, "initiator", args.timeout)
             agent.send_notif("initiator", agent.get_serialized_descs(target_descs))
 
             message = wait_for_size_done(agent, args.timeout)
@@ -189,7 +189,8 @@ def target(args, dtype):
 
 
 def measure_size(agent, tensor, target_descs, args):
-    local_descs = get_xfer_descs(agent, tensor)
+    local_rows = get_tensor_rows(tensor)
+    local_descs = agent.get_xfer_descs(local_rows)
     if not local_descs:
         raise RuntimeError("initiator transfer descriptor creation failed")
 
@@ -225,7 +226,6 @@ def initiator(args, dtype):
 
     agent.fetch_remote_metadata("target", args.ip, args.port)
     agent.send_local_metadata(args.ip, args.port)
-    wait_for_metadata(agent, "target", args.timeout)
 
     print("# NIXL GPU-to-GPU READ latency")
     print(f"# torch_version={torch.__version__}")
@@ -249,6 +249,7 @@ def initiator(args, dtype):
                 target_descs = agent.deserialize_descs(
                     wait_for_notification(agent, "target", args.timeout)
                 )
+                wait_for_metadata(agent, "target", args.timeout)
                 result = measure_size(agent, tensor, target_descs, args)
 
                 if args.verify:
