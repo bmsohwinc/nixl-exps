@@ -5,6 +5,10 @@
 Run one target process and one initiator process on the same node. To match the
 PyTorch CUDA-copy baseline, use the target as the source GPU and the initiator
 as the destination GPU, then time NIXL READ transfers on the initiator.
+
+For physical GPU0 -> physical GPU1 with CUDA-visible-device remapping, run the
+target with `CUDA_VISIBLE_DEVICES=0 --src-device 0` and the initiator with
+`CUDA_VISIBLE_DEVICES=1 --dst-device 0`.
 """
 
 import argparse
@@ -72,6 +76,11 @@ def maybe_device_name(device):
         return "unknown"
 
 
+def configure_cuda_device(device):
+    torch.cuda.set_device(device)
+    torch.set_default_device(f"cuda:{device}")
+
+
 def make_tensor(num_bytes, dtype, device, fill_value):
     element_size = torch.empty((), dtype=dtype).element_size()
     num_elements = max(1, (num_bytes + element_size - 1) // element_size)
@@ -118,7 +127,7 @@ def post_and_wait(agent, xfer_handle):
 
 
 def target(args, dtype):
-    torch.set_default_device(f"cuda:{args.src_device}")
+    configure_cuda_device(args.src_device)
     config = nixl_agent_config(True, True, args.port)
     agent = nixl_agent("target", config)
 
@@ -178,7 +187,7 @@ def measure_size(agent, tensor, target_descs, args):
 
 
 def initiator(args, dtype):
-    torch.set_default_device(f"cuda:{args.dst_device}")
+    configure_cuda_device(args.dst_device)
     config = nixl_agent_config(True, True, 0)
     agent = nixl_agent("initiator", config)
 
@@ -188,7 +197,7 @@ def initiator(args, dtype):
 
     print("# NIXL GPU-to-GPU READ latency")
     print(f"# torch_version={torch.__version__}")
-    print(f"# src_device={args.src_device} name={maybe_device_name(args.src_device)}")
+    print(f"# src_device={args.src_device}")
     print(f"# dst_device={args.dst_device} name={maybe_device_name(args.dst_device)}")
     print(f"# dtype={args.dtype} iters={args.iters} warmup={args.warmup}")
     print(f"# copies_per_iter={args.copies_per_iter}")
@@ -240,8 +249,18 @@ def parse_args():
     parser.add_argument("--ip", required=True, help="target/listen IP address")
     parser.add_argument("--port", type=int, default=5555)
     parser.add_argument("--mode", choices=("target", "initiator"), required=True)
-    parser.add_argument("--src-device", type=int, default=0)
-    parser.add_argument("--dst-device", type=int, default=1)
+    parser.add_argument(
+        "--src-device",
+        type=int,
+        default=0,
+        help="process-local CUDA device used by the target/source process",
+    )
+    parser.add_argument(
+        "--dst-device",
+        type=int,
+        default=1,
+        help="process-local CUDA device used by the initiator/destination process",
+    )
     parser.add_argument(
         "--sizes",
         type=parse_sizes,
@@ -265,13 +284,12 @@ def main():
     args = parse_args()
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is not available to PyTorch")
-    if torch.cuda.device_count() <= max(args.src_device, args.dst_device):
+    active_device = args.src_device if args.mode == "target" else args.dst_device
+    if torch.cuda.device_count() <= active_device:
         raise SystemExit(
-            f"need devices {args.src_device} and {args.dst_device}, "
+            f"need visible CUDA device {active_device}, "
             f"but PyTorch sees {torch.cuda.device_count()} CUDA device(s)"
         )
-    if args.src_device == args.dst_device:
-        raise SystemExit("--src-device and --dst-device must be different")
     if args.iters <= 0 or args.warmup < 0 or args.copies_per_iter <= 0:
         raise SystemExit("--iters and --copies-per-iter must be > 0; --warmup >= 0")
 

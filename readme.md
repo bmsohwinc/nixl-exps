@@ -15,16 +15,17 @@ python tests/cuda_p2p_latency_baseline.py \
 #### simple nixl p2p latency test
 ```sh
 # on terminal 1
-python tests/nixl_p2p_latency.py \
+CUDA_VISIBLE_DEVICES=0 python tests/nixl_p2p_latency.py \
   --mode target \
   --ip 127.0.0.1 \
-  --port 5555 \
   --src-device 0 \
-  --dst-device 1
+  --sizes 4,64,256,1k,4k,64k,1m,16m
 
 # on terminal 2
-python tests/nixl_p2p_latency.py --mode initiator --ip 127.0.0.1 \
-  --src-device 0 --dst-device 1 \
+CUDA_VISIBLE_DEVICES=1 python tests/nixl_p2p_latency.py \
+  --mode initiator \
+  --ip 127.0.0.1 \
+  --dst-device 0 \
   --sizes 4,64,256,1k,4k,64k,1m,16m \
   --copies-per-iter 100 \
   --iters 1000 \
