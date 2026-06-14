@@ -81,49 +81,80 @@ def configure_cuda_device(device):
     torch.set_default_device(f"cuda:{device}")
 
 
-def make_tensor(num_bytes, dtype, device, fill_value):
+def make_tensor(num_bytes, dtype, device, fill_value, row_bytes):
     element_size = torch.empty((), dtype=dtype).element_size()
     num_elements = max(1, (num_bytes + element_size - 1) // element_size)
-    tensor = torch.empty(num_elements, dtype=dtype, device=device)
+    row_elements = max(1, row_bytes // element_size)
+    row_elements = min(row_elements, num_elements)
+    num_rows = (num_elements + row_elements - 1) // row_elements
+    padded_elements = num_rows * row_elements
+    tensor = torch.empty((num_rows, row_elements), dtype=dtype, device=device)
     tensor.fill_(fill_value)
-    return tensor
+    return tensor, num_elements, padded_elements * element_size
 
 
-def wait_for_metadata(agent, peer_name):
-    while not agent.check_remote_metadata(peer_name):
-        pass
+def get_xfer_descs(agent, tensor):
+    rows = [tensor[i, :] for i in range(tensor.shape[0])]
+    return agent.get_xfer_descs(rows)
 
 
-def wait_for_notification(agent, peer_name):
+def wait_until(predicate, description, timeout_seconds):
+    deadline = time.monotonic() + timeout_seconds
     while True:
+        result = predicate()
+        if result:
+            return result
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"timed out waiting for {description}")
+
+
+def wait_for_metadata(agent, peer_name, timeout_seconds):
+    wait_until(
+        lambda: agent.check_remote_metadata(peer_name),
+        f"metadata from {peer_name}",
+        timeout_seconds,
+    )
+
+
+def wait_for_notification(agent, peer_name, timeout_seconds):
+    def poll():
         notifs = agent.get_new_notifs()
         if peer_name in notifs and notifs[peer_name]:
             return notifs[peer_name][0]
+        return None
+
+    return wait_until(poll, f"notification from {peer_name}", timeout_seconds)
 
 
-def wait_for_size_done(agent):
-    while True:
+def wait_for_size_done(agent, timeout_seconds):
+    def poll():
         notifs = agent.get_new_notifs()
         for messages in notifs.values():
             for message in messages:
                 if message.startswith(SIZE_DONE_PREFIX):
                     return message
+        return None
+
+    return wait_until(poll, "size completion notification", timeout_seconds)
 
 
-def wait_for_xfer(agent, xfer_handle):
+def wait_for_xfer(agent, xfer_handle, timeout_seconds):
+    deadline = time.monotonic() + timeout_seconds
     while True:
         state = agent.check_xfer_state(xfer_handle)
         if state == "DONE":
             return
         if state == "ERR":
             raise RuntimeError("NIXL transfer entered ERR state")
+        if time.monotonic() >= deadline:
+            raise TimeoutError("timed out waiting for NIXL transfer completion")
 
 
-def post_and_wait(agent, xfer_handle):
+def post_and_wait(agent, xfer_handle, timeout_seconds):
     state = agent.transfer(xfer_handle)
     if state == "ERR":
         raise RuntimeError("posting NIXL transfer failed")
-    wait_for_xfer(agent, xfer_handle)
+    wait_for_xfer(agent, xfer_handle, timeout_seconds)
 
 
 def target(args, dtype):
@@ -131,11 +162,12 @@ def target(args, dtype):
     config = nixl_agent_config(True, True, args.port)
     agent = nixl_agent("target", config)
 
-    wait_for_metadata(agent, "initiator")
+    wait_for_metadata(agent, "initiator", args.timeout)
 
     for num_bytes in args.sizes:
-        tensor = make_tensor(num_bytes, dtype, f"cuda:{args.src_device}", 1)
-        actual_bytes = tensor.numel() * tensor.element_size()
+        tensor, _, actual_bytes = make_tensor(
+            num_bytes, dtype, f"cuda:{args.src_device}", 1, args.row_bytes
+        )
         torch.cuda.synchronize(args.src_device)
 
         reg_descs = agent.register_memory(tensor)
@@ -143,12 +175,12 @@ def target(args, dtype):
             raise RuntimeError("target memory registration failed")
 
         try:
-            target_descs = agent.get_xfer_descs([tensor])
+            target_descs = get_xfer_descs(agent, tensor)
             if not target_descs:
                 raise RuntimeError("target transfer descriptor creation failed")
             agent.send_notif("initiator", agent.get_serialized_descs(target_descs))
 
-            message = wait_for_size_done(agent)
+            message = wait_for_size_done(agent, args.timeout)
             expected = SIZE_DONE_PREFIX + str(actual_bytes).encode()
             if message != expected:
                 raise RuntimeError(f"unexpected size completion message: {message!r}")
@@ -157,7 +189,7 @@ def target(args, dtype):
 
 
 def measure_size(agent, tensor, target_descs, args):
-    local_descs = agent.get_xfer_descs([tensor])
+    local_descs = get_xfer_descs(agent, tensor)
     if not local_descs:
         raise RuntimeError("initiator transfer descriptor creation failed")
 
@@ -167,13 +199,13 @@ def measure_size(agent, tensor, target_descs, args):
 
     try:
         for _ in range(args.warmup):
-            post_and_wait(agent, xfer_handle)
+            post_and_wait(agent, xfer_handle, args.timeout)
 
         samples_us = []
         for _ in range(args.iters):
             start = time.perf_counter()
             for _ in range(args.copies_per_iter):
-                post_and_wait(agent, xfer_handle)
+                post_and_wait(agent, xfer_handle, args.timeout)
             end = time.perf_counter()
             samples_us.append((end - start) * 1_000_000.0 / args.copies_per_iter)
     finally:
@@ -193,7 +225,7 @@ def initiator(args, dtype):
 
     agent.fetch_remote_metadata("target", args.ip, args.port)
     agent.send_local_metadata(args.ip, args.port)
-    wait_for_metadata(agent, "target")
+    wait_for_metadata(agent, "target", args.timeout)
 
     print("# NIXL GPU-to-GPU READ latency")
     print(f"# torch_version={torch.__version__}")
@@ -201,26 +233,29 @@ def initiator(args, dtype):
     print(f"# dst_device={args.dst_device} name={maybe_device_name(args.dst_device)}")
     print(f"# dtype={args.dtype} iters={args.iters} warmup={args.warmup}")
     print(f"# copies_per_iter={args.copies_per_iter}")
+    print(f"# row_bytes={args.row_bytes}")
     print("bytes,nixl_mean_us,nixl_p50_us,nixl_p95_us,effective_gib_s")
 
     try:
         for num_bytes in args.sizes:
-            tensor = make_tensor(num_bytes, dtype, f"cuda:{args.dst_device}", 0)
-            actual_bytes = tensor.numel() * tensor.element_size()
+            tensor, logical_elements, actual_bytes = make_tensor(
+                num_bytes, dtype, f"cuda:{args.dst_device}", 0, args.row_bytes
+            )
             reg_descs = agent.register_memory(tensor)
             if not reg_descs:
                 raise RuntimeError("initiator memory registration failed")
 
             try:
                 target_descs = agent.deserialize_descs(
-                    wait_for_notification(agent, "target")
+                    wait_for_notification(agent, "target", args.timeout)
                 )
                 result = measure_size(agent, tensor, target_descs, args)
 
                 if args.verify:
                     torch.cuda.synchronize(args.dst_device)
-                    expected = torch.ones_like(tensor)
-                    if not torch.equal(tensor, expected):
+                    flat = tensor.reshape(-1)
+                    expected = torch.ones_like(flat[:logical_elements])
+                    if not torch.equal(flat[:logical_elements], expected):
                         raise RuntimeError("destination tensor verification failed")
 
                 gib = actual_bytes / 1024**3
@@ -276,6 +311,18 @@ def parse_args():
         default=1,
         help="Batch this many completed NIXL transfers per timed iteration.",
     )
+    parser.add_argument(
+        "--row-bytes",
+        type=parse_size,
+        default=parse_size("64k"),
+        help="row size for NIXL transfer descriptors; mirrors basic_two_peers row views",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=60.0,
+        help="seconds to wait for metadata, notifications, or transfer completion",
+    )
     parser.add_argument("--verify", action="store_true")
     return parser.parse_args()
 
@@ -292,6 +339,8 @@ def main():
         )
     if args.iters <= 0 or args.warmup < 0 or args.copies_per_iter <= 0:
         raise SystemExit("--iters and --copies-per-iter must be > 0; --warmup >= 0")
+    if args.row_bytes <= 0 or args.timeout <= 0:
+        raise SystemExit("--row-bytes and --timeout must be > 0")
 
     dtype = DTYPES[args.dtype]
     if args.mode == "target":
