@@ -360,7 +360,7 @@ def parse_args():
     parser.add_argument(
         "--timeout",
         type=float,
-        default=60.0,
+        default=3600.0,
         help="seconds to wait for metadata, notifications, or transfer completion",
     )
     parser.add_argument("--verify", action="store_true")
