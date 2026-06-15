@@ -29,6 +29,7 @@ DTYPES = {
 }
 
 SIZE_DONE_PREFIX = b"SIZE_DONE:"
+RUN_DONE = b"RUN_DONE"
 
 
 def parse_size(size_text):
@@ -137,6 +138,18 @@ def wait_for_size_done(agent, timeout_seconds):
     return wait_until(poll, "size completion notification", timeout_seconds)
 
 
+def wait_for_run_done(agent, timeout_seconds):
+    def poll():
+        notifs = agent.get_new_notifs()
+        for messages in notifs.values():
+            for message in messages:
+                if message == RUN_DONE:
+                    return message
+        return None
+
+    return wait_until(poll, "run completion notification", timeout_seconds)
+
+
 def wait_for_xfer(agent, xfer_handle, timeout_seconds):
     deadline = time.monotonic() + timeout_seconds
     while True:
@@ -186,6 +199,8 @@ def target(args, dtype):
                 raise RuntimeError(f"unexpected size completion message: {message!r}")
         finally:
             agent.deregister_memory(reg_descs)
+
+    wait_for_run_done(agent, args.timeout)
 
 
 def measure_size(agent, tensor, target_descs, args):
@@ -274,8 +289,18 @@ def initiator(args, dtype):
             finally:
                 agent.deregister_memory(reg_descs)
     finally:
-        agent.remove_remote_agent("target")
-        agent.invalidate_local_metadata(args.ip, args.port)
+        try:
+            agent.send_notif("target", RUN_DONE)
+        except Exception:
+            pass
+        try:
+            agent.remove_remote_agent("target")
+        except Exception:
+            pass
+        try:
+            agent.invalidate_local_metadata(args.ip, args.port)
+        except Exception:
+            pass
 
 
 def parse_args():
