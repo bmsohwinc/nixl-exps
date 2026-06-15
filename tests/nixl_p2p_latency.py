@@ -94,6 +94,17 @@ def make_tensor(num_bytes, dtype, device, fill_value, row_bytes):
     return tensor, num_elements, padded_elements * element_size
 
 
+def tensor_prefix_view(tensor, num_bytes, dtype, row_bytes):
+    element_size = torch.empty((), dtype=dtype).element_size()
+    logical_elements = max(1, (num_bytes + element_size - 1) // element_size)
+    row_elements = max(1, row_bytes // element_size)
+    row_elements = min(row_elements, logical_elements)
+    num_rows = (logical_elements + row_elements - 1) // row_elements
+    padded_elements = num_rows * row_elements
+    view = tensor.reshape(-1)[:padded_elements].reshape(num_rows, row_elements)
+    return view, logical_elements, padded_elements * element_size
+
+
 def get_tensor_rows(tensor):
     return [tensor[i, :] for i in range(tensor.shape[0])]
 
@@ -174,18 +185,20 @@ def target(args, dtype):
     config = nixl_agent_config(True, True, args.port)
     agent = nixl_agent("target", config)
 
-    for num_bytes in args.sizes:
-        tensor, _, actual_bytes = make_tensor(
-            num_bytes, dtype, f"cuda:{args.src_device}", 1, args.row_bytes
-        )
-        torch.cuda.synchronize(args.src_device)
+    tensor, _, _ = make_tensor(
+        max(args.sizes), dtype, f"cuda:{args.src_device}", 1, args.row_bytes
+    )
+    torch.cuda.synchronize(args.src_device)
+    reg_descs = agent.register_memory(tensor)
+    if not reg_descs:
+        raise RuntimeError("target memory registration failed")
 
-        reg_descs = agent.register_memory(tensor)
-        if not reg_descs:
-            raise RuntimeError("target memory registration failed")
-
-        try:
-            target_rows = get_tensor_rows(tensor)
+    try:
+        for num_bytes in args.sizes:
+            view, _, actual_bytes = tensor_prefix_view(
+                tensor, num_bytes, dtype, args.row_bytes
+            )
+            target_rows = get_tensor_rows(view)
             target_descs = agent.get_xfer_descs(target_rows)
             if not target_descs:
                 raise RuntimeError("target transfer descriptor creation failed")
@@ -197,10 +210,10 @@ def target(args, dtype):
             expected = SIZE_DONE_PREFIX + str(actual_bytes).encode()
             if message != expected:
                 raise RuntimeError(f"unexpected size completion message: {message!r}")
-        finally:
-            agent.deregister_memory(reg_descs)
 
-    wait_for_run_done(agent, args.timeout)
+        wait_for_run_done(agent, args.timeout)
+    finally:
+        agent.deregister_memory(reg_descs)
 
 
 def measure_size(agent, tensor, target_descs, args):
@@ -239,6 +252,13 @@ def initiator(args, dtype):
     config = nixl_agent_config(True, True, 0)
     agent = nixl_agent("initiator", config)
 
+    tensor, _, _ = make_tensor(
+        max(args.sizes), dtype, f"cuda:{args.dst_device}", 0, args.row_bytes
+    )
+    reg_descs = agent.register_memory(tensor)
+    if not reg_descs:
+        raise RuntimeError("initiator memory registration failed")
+
     agent.fetch_remote_metadata("target", args.ip, args.port)
     agent.send_local_metadata(args.ip, args.port)
 
@@ -253,41 +273,34 @@ def initiator(args, dtype):
 
     try:
         for num_bytes in args.sizes:
-            tensor, logical_elements, actual_bytes = make_tensor(
-                num_bytes, dtype, f"cuda:{args.dst_device}", 0, args.row_bytes
+            view, logical_elements, actual_bytes = tensor_prefix_view(
+                tensor, num_bytes, dtype, args.row_bytes
             )
-            reg_descs = agent.register_memory(tensor)
-            if not reg_descs:
-                raise RuntimeError("initiator memory registration failed")
+            target_descs = agent.deserialize_descs(
+                wait_for_notification(agent, "target", args.timeout)
+            )
+            wait_for_metadata(agent, "target", args.timeout)
+            result = measure_size(agent, view, target_descs, args)
 
-            try:
-                target_descs = agent.deserialize_descs(
-                    wait_for_notification(agent, "target", args.timeout)
-                )
-                wait_for_metadata(agent, "target", args.timeout)
-                result = measure_size(agent, tensor, target_descs, args)
+            if args.verify:
+                torch.cuda.synchronize(args.dst_device)
+                flat = view.reshape(-1)
+                expected = torch.ones_like(flat[:logical_elements])
+                if not torch.equal(flat[:logical_elements], expected):
+                    raise RuntimeError("destination tensor verification failed")
 
-                if args.verify:
-                    torch.cuda.synchronize(args.dst_device)
-                    flat = tensor.reshape(-1)
-                    expected = torch.ones_like(flat[:logical_elements])
-                    if not torch.equal(flat[:logical_elements], expected):
-                        raise RuntimeError("destination tensor verification failed")
-
-                gib = actual_bytes / 1024**3
-                seconds = result["mean_us"] / 1_000_000.0
-                bandwidth = gib / seconds if seconds > 0 else 0.0
-                print(
-                    f"{actual_bytes},"
-                    f"{result['mean_us']:.3f},"
-                    f"{result['p50_us']:.3f},"
-                    f"{result['p95_us']:.3f},"
-                    f"{bandwidth:.3f}",
-                    flush=True,
-                )
-                agent.send_notif("target", SIZE_DONE_PREFIX + str(actual_bytes).encode())
-            finally:
-                agent.deregister_memory(reg_descs)
+            gib = actual_bytes / 1024**3
+            seconds = result["mean_us"] / 1_000_000.0
+            bandwidth = gib / seconds if seconds > 0 else 0.0
+            print(
+                f"{actual_bytes},"
+                f"{result['mean_us']:.3f},"
+                f"{result['p50_us']:.3f},"
+                f"{result['p95_us']:.3f},"
+                f"{bandwidth:.3f}",
+                flush=True,
+            )
+            agent.send_notif("target", SIZE_DONE_PREFIX + str(actual_bytes).encode())
     finally:
         try:
             agent.send_notif("target", RUN_DONE)
@@ -301,6 +314,7 @@ def initiator(args, dtype):
             agent.invalidate_local_metadata(args.ip, args.port)
         except Exception:
             pass
+        agent.deregister_memory(reg_descs)
 
 
 def parse_args():
